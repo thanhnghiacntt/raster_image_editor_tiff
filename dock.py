@@ -1,0 +1,672 @@
+# -*- coding: utf-8 -*-
+"""Bảng điều khiển (dock) của plugin Raster Image Editor Tiff."""
+
+import os
+
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QImage, QKeySequence
+from qgis.PyQt.QtWidgets import (
+    QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
+)
+from qgis.core import Qgis, QgsProject
+
+try:                                     # Qt5
+    from qgis.PyQt.QtWidgets import QShortcut
+except ImportError:                      # Qt6
+    from qgis.PyQt.QtGui import QShortcut
+
+from .exporter import COMPRESSIONS, RESAMPLE_ALGS, export_geotiff
+from .maptool import TP_DONE, TP_MESSAGES, AlignImageMapTool
+from .overlay import ImageOverlayItem
+from .placement import Placement
+from .resources import plugin_icon
+
+IMAGE_FILTER = ("Ảnh (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp);;"
+                "Tất cả các file (*.*)")
+MAX_UNDO = 60
+
+
+class RasterImageEditorTiffDock(QDockWidget):
+    """Nạp ảnh, chỉnh vị trí và xuất GeoTIFF."""
+
+    def __init__(self, iface, parent=None):
+        super().__init__("Raster Image Editor Tiff", parent)
+        self.setObjectName("RasterImageEditorTiffDock")
+        self.setWindowIcon(plugin_icon())
+        self.iface = iface
+        self.canvas = iface.mapCanvas()
+
+        self.item = ImageOverlayItem(self.canvas)
+        self.item.set_show_handles(False)
+        self.tool = AlignImageMapTool(self.canvas, self.item)
+
+        self._syncing = False
+        self._aspect = 1.0          # sy / sx dùng khi khóa tỉ lệ
+        self._undo = []
+        self._redo = []
+        self._image_path = None
+
+        self._build_ui()
+        self._connect()
+        self._build_shortcuts()
+        self._update_enabled()
+
+    # ------------------------------------------------------------------- UI
+    def _build_ui(self):
+        inner = QWidget()
+        root = QVBoxLayout(inner)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        # --- 1. Ảnh nguồn -------------------------------------------------
+        g_img = QGroupBox("1. Ảnh nguồn")
+        l_img = QVBoxLayout(g_img)
+        row = QHBoxLayout()
+        self.ed_image = QLineEdit()
+        self.ed_image.setPlaceholderText("Chọn file ảnh cần đưa vào bản đồ…")
+        self.btn_browse = QPushButton("…")
+        self.btn_browse.setFixedWidth(30)
+        self.btn_load = QPushButton("Nạp ảnh")
+        row.addWidget(self.ed_image, 1)
+        row.addWidget(self.btn_browse)
+        row.addWidget(self.btn_load)
+        l_img.addLayout(row)
+        self.lbl_info = QLabel("Chưa nạp ảnh.")
+        self.lbl_info.setWordWrap(True)
+        self.lbl_info.setStyleSheet("color: #666;")
+        l_img.addWidget(self.lbl_info)
+        root.addWidget(g_img)
+
+        # --- 2. Chỉnh trên bản đồ ----------------------------------------
+        g_edit = QGroupBox("2. Chỉnh trên bản đồ")
+        l_edit = QVBoxLayout(g_edit)
+        self.btn_edit = QPushButton("Bật chế độ kéo/chỉnh ảnh")
+        self.btn_edit.setCheckable(True)
+        l_edit.addWidget(self.btn_edit)
+
+        row2 = QHBoxLayout()
+        self.btn_two_point = QPushButton("Căn theo 2 điểm")
+        self.btn_two_point.setCheckable(True)
+        self.btn_fit = QPushButton("Vừa khung nhìn")
+        row2.addWidget(self.btn_two_point)
+        row2.addWidget(self.btn_fit)
+        l_edit.addLayout(row2)
+
+        row2b = QHBoxLayout()
+        self.btn_undo = QPushButton("↶ Hoàn tác (Ctrl+Z)")
+        self.btn_redo = QPushButton("↷ Làm lại (Ctrl+Y)")
+        row2b.addWidget(self.btn_undo)
+        row2b.addWidget(self.btn_redo)
+        l_edit.addLayout(row2b)
+
+        self.lbl_hint = QLabel(
+            "Kéo giữa ảnh để di chuyển • kéo BẤT KỲ ĐIỂM NÀO TRÊN CẠNH để co "
+            "giãn riêng theo X hoặc Y (cạnh sẽ sáng lên khi rê chuột tới) • "
+            "kéo ô vuông ở GÓC để co giãn cả hai chiều • kéo nút tròn xanh để xoay.\n"
+            "Khi phóng to, tay nắm cạnh tự bám theo phần cạnh còn nhìn thấy.\n"
+            "Shift: khóa trục khi di chuyển, đảo khóa tỉ lệ khi kéo góc, "
+            "bắt góc 15° khi xoay. Phím mũi tên: dịch từng pixel. "
+            "Ctrl+Z / Ctrl+Y: hoàn tác / làm lại. Giữ phím H: tạm giấu ảnh để nhìn nền bên dưới.")
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color:#666; font-size:11px;")
+        l_edit.addWidget(self.lbl_hint)
+        root.addWidget(g_edit)
+
+        # --- 3. Tọa độ ----------------------------------------------------
+        g_geo = QGroupBox("3. Tọa độ & kích thước")
+        grid = QGridLayout(g_geo)
+        grid.setColumnStretch(1, 1)
+
+        self.sp_cx = self._coord_spin()
+        self.sp_cy = self._coord_spin()
+        self.sp_px = self._size_spin()
+        self.sp_py = self._size_spin()
+        self.sp_rot = QDoubleSpinBox()
+        self.sp_rot.setRange(-360.0, 360.0)
+        self.sp_rot.setDecimals(4)
+        self.sp_rot.setSingleStep(0.5)
+        self.sp_rot.setSuffix(" °")
+
+        grid.addWidget(QLabel("Tâm ảnh X:"), 0, 0)
+        grid.addWidget(self.sp_cx, 0, 1)
+        grid.addWidget(QLabel("Tâm ảnh Y:"), 1, 0)
+        grid.addWidget(self.sp_cy, 1, 1)
+        grid.addWidget(QLabel("Kích thước pixel X:"), 2, 0)
+        grid.addWidget(self.sp_px, 2, 1)
+        grid.addWidget(QLabel("Kích thước pixel Y:"), 3, 0)
+        grid.addWidget(self.sp_py, 3, 1)
+        grid.addWidget(QLabel("Góc xoay:"), 4, 0)
+        grid.addWidget(self.sp_rot, 4, 1)
+
+        self.cb_lock = QCheckBox("Khóa tỉ lệ (áp dụng cho tay nắm góc và ô nhập số)")
+        self.cb_lock.setToolTip(
+            "Bật: kéo tay nắm ở góc giữ nguyên tỉ lệ khung ảnh, đổi một ô "
+            "kích thước pixel sẽ đổi ô kia theo.\n"
+            "Tay nắm ở cạnh luôn co giãn riêng theo một trục, không phụ thuộc "
+            "tùy chọn này.")
+        self.cb_lock.setChecked(True)
+        grid.addWidget(self.cb_lock, 5, 0, 1, 2)
+
+        self.lbl_span = QLabel("—")
+        self.lbl_span.setStyleSheet("color:#666;")
+        grid.addWidget(QLabel("Kích thước thực:"), 6, 0)
+        grid.addWidget(self.lbl_span, 6, 1)
+
+        self.cb_show_image = QCheckBox("Hiện ảnh trên bản đồ "
+                                       "(bỏ chọn để so với nền — hoặc giữ phím H)")
+        self.cb_show_image.setChecked(True)
+        self.cb_show_image.setToolTip(
+            "Bỏ chọn để tạm giấu ảnh mà vẫn giữ khung viền và tay nắm, "
+            "tiện đối chiếu với lớp nền bên dưới.")
+        grid.addWidget(self.cb_show_image, 7, 0, 1, 2)
+
+        row3 = QHBoxLayout()
+        self.sl_opacity = QSlider(Qt.Horizontal)
+        self.sl_opacity.setRange(10, 100)
+        self.sl_opacity.setValue(100)
+        self.lbl_opacity = QLabel("100%")
+        self.lbl_opacity.setFixedWidth(38)
+        row3.addWidget(self.sl_opacity, 1)
+        row3.addWidget(self.lbl_opacity)
+        grid.addWidget(QLabel("Độ mờ:"), 8, 0)
+        grid.addLayout(row3, 8, 1)
+        root.addWidget(g_geo)
+
+        # --- 4. Xuất ------------------------------------------------------
+        g_out = QGroupBox("4. Xuất GeoTIFF")
+        l_out = QVBoxLayout(g_out)
+
+        self.lbl_crs = QLabel("Hệ tọa độ: —")
+        self.lbl_crs.setWordWrap(True)
+        l_out.addWidget(self.lbl_crs)
+
+        row4 = QHBoxLayout()
+        self.ed_output = QLineEdit()
+        self.ed_output.setPlaceholderText("Đường dẫn file .tif đầu ra…")
+        self.btn_out_browse = QPushButton("…")
+        self.btn_out_browse.setFixedWidth(30)
+        row4.addWidget(self.ed_output, 1)
+        row4.addWidget(self.btn_out_browse)
+        l_out.addLayout(row4)
+
+        g2 = QGridLayout()
+        self.cmb_comp = QComboBox()
+        self.cmb_comp.addItems(COMPRESSIONS)
+        self.sp_quality = QSpinBox()
+        self.sp_quality.setRange(10, 100)
+        self.sp_quality.setValue(85)
+        self.sp_quality.setEnabled(False)
+        g2.addWidget(QLabel("Nén:"), 0, 0)
+        g2.addWidget(self.cmb_comp, 0, 1)
+        g2.addWidget(QLabel("Chất lượng JPEG:"), 1, 0)
+        g2.addWidget(self.sp_quality, 1, 1)
+
+        self.cmb_resample = QComboBox()
+        self.cmb_resample.addItems(RESAMPLE_ALGS)
+        self.cmb_resample.setCurrentText('bilinear')
+        self.cmb_resample.setEnabled(False)
+        g2.addWidget(QLabel("Nội suy khi nắn:"), 2, 0)
+        g2.addWidget(self.cmb_resample, 2, 1)
+        g2.setColumnStretch(1, 1)
+        l_out.addLayout(g2)
+
+        self.cb_northup = QCheckBox("Nắn ảnh thẳng hướng Bắc (nội suy lại)")
+        self.cb_alpha = QCheckBox("Giữ kênh trong suốt (alpha)")
+        self.cb_alpha.setChecked(True)
+        self.cb_ovr = QCheckBox("Tạo overview (kim tự tháp)")
+        self.cb_ovr.setChecked(True)
+        self.cb_wld = QCheckBox("Ghi kèm world file (.tfw + .prj)")
+        self.cb_add = QCheckBox("Thêm vào bản đồ sau khi xuất")
+        self.cb_add.setChecked(True)
+        for cb in (self.cb_northup, self.cb_alpha, self.cb_ovr, self.cb_wld, self.cb_add):
+            l_out.addWidget(cb)
+
+        self.btn_export = QPushButton("XUẤT GEOTIFF")
+        self.btn_export.setMinimumHeight(32)
+        l_out.addWidget(self.btn_export)
+
+        self.btn_clear = QPushButton("Gỡ ảnh khỏi bản đồ")
+        l_out.addWidget(self.btn_clear)
+        root.addWidget(g_out)
+
+        # --- 5. Xuất tile -------------------------------------------------
+        g_tile = QGroupBox("5. Xuất bộ tile bản đồ")
+        l_tile = QVBoxLayout(g_tile)
+        self.btn_tiles = QPushButton("Xuất tile XYZ / MBTiles…")
+        self.btn_tiles.setMinimumHeight(30)
+        l_tile.addWidget(self.btn_tiles)
+        lbl_tile = QLabel(
+            "Cắt ảnh đã căn (và/hoặc các lớp đang hiện) thành bộ tile Web "
+            "Mercator: thư mục z/x/y, file ZIP hoặc MBTiles — dùng được cho "
+            "Leaflet, OpenLayers, Mapbox, QGIS…")
+        lbl_tile.setWordWrap(True)
+        lbl_tile.setStyleSheet("color:#666; font-size:11px;")
+        l_tile.addWidget(lbl_tile)
+        root.addWidget(g_tile)
+
+        root.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(inner)
+        self.setWidget(scroll)
+        self.setMinimumWidth(330)
+
+    @staticmethod
+    def _coord_spin():
+        sp = QDoubleSpinBox()
+        sp.setRange(-1e12, 1e12)
+        sp.setDecimals(6)
+        sp.setSingleStep(1.0)
+        sp.setKeyboardTracking(False)
+        sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return sp
+
+    @staticmethod
+    def _size_spin():
+        sp = QDoubleSpinBox()
+        sp.setRange(1e-12, 1e9)
+        sp.setDecimals(10)
+        sp.setSingleStep(0.01)
+        sp.setKeyboardTracking(False)
+        sp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return sp
+
+    # -------------------------------------------------------------- tín hiệu
+    def _connect(self):
+        self.btn_browse.clicked.connect(self._browse_image)
+        self.btn_load.clicked.connect(self._load_image)
+        self.ed_image.returnPressed.connect(self._load_image)
+        self.btn_edit.toggled.connect(self._toggle_edit)
+        self.btn_two_point.toggled.connect(self._toggle_two_point)
+        self.btn_fit.clicked.connect(self.fit_to_canvas)
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_redo.clicked.connect(self.redo)
+        self.btn_clear.clicked.connect(self.clear_image)
+        self.btn_out_browse.clicked.connect(self._browse_output)
+        self.btn_export.clicked.connect(self.do_export)
+        self.btn_tiles.clicked.connect(self.open_tile_dialog)
+        self.cmb_comp.currentTextChanged.connect(self._on_comp_changed)
+        self.cb_northup.toggled.connect(self.cmb_resample.setEnabled)
+        self.cb_lock.toggled.connect(self._on_lock_changed)
+        self.cb_show_image.toggled.connect(self._on_show_image)
+        self.sl_opacity.valueChanged.connect(self._on_opacity)
+
+        for sp in (self.sp_cx, self.sp_cy, self.sp_px, self.sp_py, self.sp_rot):
+            sp.valueChanged.connect(self._on_field_changed)
+
+        self.tool.placementChanged.connect(self._refresh_fields)
+        self.tool.editStarted.connect(self.push_undo)
+        self.tool.editReverted.connect(self.drop_last_undo)
+        self.tool.undoRequested.connect(self.undo)
+        self.tool.peekChanged.connect(self._on_peek)
+        self.tool.redoRequested.connect(self.redo)
+        self.tool.twoPointStep.connect(self._on_two_point_step)
+        self.tool.twoPointFinished.connect(self._on_two_point_finished)
+        self.canvas.mapToolSet.connect(self._on_map_tool_set)
+        QgsProject.instance().crsChanged.connect(self._refresh_crs_label)
+
+    def _build_shortcuts(self):
+        """Ctrl+Z / Ctrl+Y khi con trỏ đang ở trong bảng điều khiển.
+
+        Phạm vi giới hạn trong dock nên không đụng phím tắt Undo của QGIS;
+        khi đang thao tác trên canvas thì `AlignImageMapTool` xử lý (xem
+        `maptool._filter_watch`).
+        """
+        self._shortcuts = []
+        wanted = [(QKeySequence("Ctrl+Z"), self.undo),
+                  (QKeySequence("Ctrl+Y"), self.redo),
+                  (QKeySequence("Ctrl+Shift+Z"), self.redo)]
+        for std, slot in ((QKeySequence.Undo, self.undo),
+                          (QKeySequence.Redo, self.redo)):
+            for seq in QKeySequence.keyBindings(std):
+                wanted.append((seq, slot))
+
+        seen = set()
+        for seq, slot in wanted:
+            text = seq.toString()
+            if not text or text in seen:     # tránh phím tắt trùng -> Qt bỏ qua cả hai
+                continue
+            seen.add(text)
+            sc = QShortcut(seq, self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
+
+    # ------------------------------------------------------------- nạp / gỡ
+    def _browse_image(self):
+        start = os.path.dirname(self.ed_image.text()) or ''
+        path, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh", start, IMAGE_FILTER)
+        if path:
+            self.ed_image.setText(path)
+            self._load_image()
+
+    def _load_image(self):
+        path = self.ed_image.text().strip('"').strip()
+        if not path or not os.path.isfile(path):
+            self._msg("Không tìm thấy file ảnh.", Qgis.Warning)
+            return
+        image = QImage(path)
+        if image.isNull():
+            self._msg("Không đọc được ảnh (định dạng không hỗ trợ?).", Qgis.Critical)
+            return
+
+        self._image_path = path
+        self._undo = []
+        self._redo = []
+        self.item.source_path = path
+        self.cb_show_image.setChecked(True)
+        self.item.set_image_visible(True)
+        self.item.set_image(image)
+        placement = Placement.fit_in_extent(self.canvas.extent(),
+                                            image.width(), image.height())
+        self.item.set_placement(placement)
+        self._aspect = placement.aspect
+
+        self.lbl_info.setText("%s — %d × %d pixel"
+                              % (os.path.basename(path), image.width(), image.height()))
+        if not self.ed_output.text().strip():
+            base = os.path.splitext(path)[0]
+            self.ed_output.setText(base + "_georef.tif")
+
+        self._refresh_crs_label()
+        self._refresh_fields()
+        self._update_enabled()
+        self.btn_edit.setChecked(True)
+        self._msg("Đã nạp ảnh. Kéo/chỉnh trên bản đồ rồi bấm XUẤT GEOTIFF.", Qgis.Info)
+
+    def clear_image(self):
+        self.tool.stop_two_point()
+        self.item.set_image(None)
+        self.item.set_placement(None)
+        self._image_path = None
+        self._undo = []
+        self._redo = []
+        self.lbl_info.setText("Chưa nạp ảnh.")
+        self.btn_edit.setChecked(False)
+        self._update_enabled()
+
+    # ------------------------------------------------------------- chế độ tool
+    def _toggle_edit(self, checked):
+        if checked:
+            if not self.item.has_image():
+                self.btn_edit.setChecked(False)
+                return
+            self.canvas.setMapTool(self.tool)
+        elif self.canvas.mapTool() is self.tool:
+            self.canvas.unsetMapTool(self.tool)
+        self.btn_edit.setText("Đang chỉnh ảnh (bấm để tắt)" if checked
+                              else "Bật chế độ kéo/chỉnh ảnh")
+
+    def _on_map_tool_set(self, new_tool, old_tool=None):
+        active = new_tool is self.tool
+        if self.btn_edit.isChecked() != active:
+            self.btn_edit.blockSignals(True)
+            self.btn_edit.setChecked(active)
+            self.btn_edit.blockSignals(False)
+            self.btn_edit.setText("Đang chỉnh ảnh (bấm để tắt)" if active
+                                  else "Bật chế độ kéo/chỉnh ảnh")
+        if not active and self.btn_two_point.isChecked():
+            self.btn_two_point.setChecked(False)
+
+    def _toggle_two_point(self, checked):
+        if checked:
+            if not self.item.has_image():
+                self.btn_two_point.setChecked(False)
+                return
+            self.btn_edit.setChecked(True)
+            self.tool.start_two_point()
+        else:
+            self.tool.stop_two_point()
+
+    def _on_two_point_step(self, step):
+        if step == TP_DONE:
+            if self.btn_two_point.isChecked():
+                self.btn_two_point.blockSignals(True)
+                self.btn_two_point.setChecked(False)
+                self.btn_two_point.blockSignals(False)
+            self.lbl_hint.setStyleSheet("color:#666; font-size:11px;")
+            return
+        self.lbl_hint.setText(TP_MESSAGES[step] + "\n(Nhấn Esc để hủy.)")
+        self.lbl_hint.setStyleSheet("color:#0a5; font-weight:bold; font-size:11px;")
+
+    def _on_two_point_finished(self, ok, message):
+        self._msg(message, Qgis.Success if ok else Qgis.Warning)
+        self._refresh_fields()
+
+    # ------------------------------------------------------------ đồng bộ UI
+    def _refresh_crs_label(self):
+        crs = QgsProject.instance().crs()
+        self.lbl_crs.setText("Hệ tọa độ xuất ra (theo dự án): %s"
+                             % (crs.authid() or crs.description() or "không xác định"))
+        p = self.item.placement
+        if p is not None:
+            geographic = crs.isGeographic()
+            for sp in (self.sp_px, self.sp_py):
+                sp.setSingleStep(1e-6 if geographic else 0.01)
+
+    def _refresh_fields(self):
+        p = self.item.placement
+        if p is None:
+            return
+        self._syncing = True
+        try:
+            self.sp_cx.setValue(p.cx)
+            self.sp_cy.setValue(p.cy)
+            self.sp_px.setValue(p.sx)
+            self.sp_py.setValue(p.sy)
+            self.sp_rot.setValue(p.rotation)
+        finally:
+            self._syncing = False
+        units = QgsProject.instance().crs().isGeographic() and "°" or "đvbđ"
+        self.lbl_span.setText("%.4f × %.4f %s"
+                              % (p.width * p.sx, p.height * p.sy, units))
+
+    def _on_field_changed(self):
+        if self._syncing or self.item.placement is None:
+            return
+        sender = self.sender()
+        p = self.item.placement.clone()
+        self.push_undo()
+
+        sx, sy = self.sp_px.value(), self.sp_py.value()
+        if self.cb_lock.isChecked():
+            if sender is self.sp_px:
+                sy = sx * self._aspect
+            elif sender is self.sp_py:
+                sx = sy / self._aspect if self._aspect else sx
+        p.cx = self.sp_cx.value()
+        p.cy = self.sp_cy.value()
+        p.sx = max(sx, 1e-12)
+        p.sy = max(sy, 1e-12)
+        p.rotation = self.sp_rot.value()
+        self.item.set_placement(p)
+        if not self.cb_lock.isChecked():
+            self._aspect = p.aspect
+        self._refresh_fields()
+
+    def _on_lock_changed(self, checked):
+        self.tool.lock_aspect = checked
+        if checked and self.item.placement is not None:
+            self._aspect = self.item.placement.aspect
+
+    def _on_show_image(self, checked):
+        self.item.set_image_visible(checked)
+        self.sl_opacity.setEnabled(checked and self.item.has_image())
+
+    def _on_peek(self, hidden):
+        """Giữ phím H trên canvas: tạm giấu ảnh, thả ra thì trả về như cũ."""
+        self.item.set_image_visible(False if hidden
+                                    else self.cb_show_image.isChecked())
+
+    def _on_opacity(self, value):
+        self.item.set_opacity_value(value / 100.0)
+        self.lbl_opacity.setText("%d%%" % value)
+
+    def _on_comp_changed(self, text):
+        self.sp_quality.setEnabled(text.upper() == 'JPEG')
+        if text.upper() == 'JPEG' and self.cb_alpha.isChecked():
+            self.cb_alpha.setChecked(False)
+        self.cb_alpha.setEnabled(text.upper() != 'JPEG')
+
+    def _update_enabled(self):
+        has = self.item.has_image()
+        for w in (self.btn_edit, self.btn_two_point, self.btn_fit,
+                  self.btn_export, self.btn_clear, self.sp_cx, self.sp_cy,
+                  self.sp_px, self.sp_py, self.sp_rot, self.cb_lock,
+                  self.cb_show_image, self.sl_opacity):
+            w.setEnabled(has)
+        self.sl_opacity.setEnabled(has and self.cb_show_image.isChecked())
+        self._update_history_buttons()
+
+    def _update_history_buttons(self):
+        has = self.item is not None and self.item.has_image()
+        self.btn_undo.setEnabled(has and bool(self._undo))
+        self.btn_redo.setEnabled(has and bool(self._redo))
+        self.btn_undo.setText("↶ Hoàn tác (Ctrl+Z)" if not self._undo
+                              else "↶ Hoàn tác %d (Ctrl+Z)" % len(self._undo))
+        self.btn_redo.setText("↷ Làm lại (Ctrl+Y)" if not self._redo
+                              else "↷ Làm lại %d (Ctrl+Y)" % len(self._redo))
+
+    # --------------------------------------------------------------- thao tác
+    def push_undo(self):
+        """Lưu trạng thái HIỆN TẠI trước khi thực hiện một thay đổi mới."""
+        if self.item.placement is None:
+            return
+        self._undo.append(self.item.placement.to_dict())
+        if len(self._undo) > MAX_UNDO:
+            self._undo.pop(0)
+        self._redo = []            # nhánh mới -> bỏ toàn bộ lịch sử làm lại
+        self._update_history_buttons()
+
+    def drop_last_undo(self):
+        """Bỏ mục vừa lưu khi hóa ra thao tác không làm thay đổi gì."""
+        if self._undo:
+            self._undo.pop()
+        self._update_history_buttons()
+
+    def undo(self):
+        if not self._undo or self.item is None or self.item.placement is None:
+            return
+        self._redo.append(self.item.placement.to_dict())
+        if len(self._redo) > MAX_UNDO:
+            self._redo.pop(0)
+        self.item.set_placement(Placement.from_dict(self._undo.pop()))
+        self._after_history_move()
+
+    def redo(self):
+        if not self._redo or self.item is None or self.item.placement is None:
+            return
+        self._undo.append(self.item.placement.to_dict())
+        if len(self._undo) > MAX_UNDO:
+            self._undo.pop(0)
+        self.item.set_placement(Placement.from_dict(self._redo.pop()))
+        self._after_history_move()
+
+    def _after_history_move(self):
+        if self.cb_lock.isChecked():
+            self._aspect = self.item.placement.aspect
+        self._refresh_fields()
+        self._update_history_buttons()
+
+    def fit_to_canvas(self):
+        if not self.item.has_image():
+            return
+        self.push_undo()
+        p = self.item.placement
+        self.item.set_placement(
+            Placement.fit_in_extent(self.canvas.extent(), p.width, p.height))
+        self._aspect = self.item.placement.aspect
+        self._refresh_fields()
+
+    def zoom_to_image(self):
+        if not self.item.has_image():
+            return
+        self.canvas.setExtent(self.item.placement.bbox().buffered(
+            self.item.placement.bbox().width() * 0.05))
+        self.canvas.refresh()
+
+    # ------------------------------------------------------------------ xuất
+    def _browse_output(self):
+        start = self.ed_output.text() or (self._image_path or '')
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu GeoTIFF", start, "GeoTIFF (*.tif *.tiff)")
+        if path:
+            if not path.lower().endswith(('.tif', '.tiff')):
+                path += '.tif'
+            self.ed_output.setText(path)
+
+    def do_export(self):
+        if not self.item.has_image():
+            return
+        out_path = self.ed_output.text().strip('"').strip()
+        if not out_path:
+            self._msg("Hãy chọn đường dẫn file GeoTIFF đầu ra.", Qgis.Warning)
+            return
+        if not out_path.lower().endswith(('.tif', '.tiff')):
+            out_path += '.tif'
+
+        crs = QgsProject.instance().crs()
+        if not crs.isValid():
+            self._msg("Dự án chưa có hệ tọa độ hợp lệ.", Qgis.Critical)
+            return
+
+        self.setCursor(Qt.WaitCursor)
+        try:
+            export_geotiff(
+                self.item.image, self.item.placement, crs, out_path,
+                compression=self.cmb_comp.currentText(),
+                jpeg_quality=self.sp_quality.value(),
+                north_up=self.cb_northup.isChecked(),
+                resample=self.cmb_resample.currentText(),
+                keep_alpha=self.cb_alpha.isChecked(),
+                build_overviews=self.cb_ovr.isChecked(),
+                world_file=self.cb_wld.isChecked(),
+            )
+        except Exception as exc:
+            self.unsetCursor()
+            self._msg("Lỗi khi xuất: %s" % exc, Qgis.Critical, 0)
+            return
+        self.unsetCursor()
+
+        if self.cb_add.isChecked():
+            layer = self.iface.addRasterLayer(
+                out_path, os.path.splitext(os.path.basename(out_path))[0])
+            if layer is None or not layer.isValid():
+                self._msg("Đã xuất file nhưng không thêm được vào bản đồ.",
+                          Qgis.Warning)
+        self._msg("Đã xuất GeoTIFF: %s" % out_path, Qgis.Success, 8)
+
+    # -------------------------------------------------------------- xuất tile
+    def open_tile_dialog(self):
+        from .tiledialog import TileExportDialog
+        if not self.item.has_image() and not self.canvas.layers():
+            self._msg("Chưa có ảnh hoặc lớp nào để cắt thành tile.", Qgis.Warning)
+            return
+        dlg = TileExportDialog(self.iface, self.item, self)
+        dlg.exec_()
+
+    # ------------------------------------------------------------------ tiện
+    def _msg(self, text, level=Qgis.Info, duration=5):
+        self.iface.messageBar().pushMessage("Raster Image Editor Tiff", text,
+                                            level=level, duration=duration)
+
+    def cleanup(self):
+        """Gỡ toàn bộ item khỏi canvas khi tắt plugin."""
+        try:
+            self.tool.stop_two_point()
+            if self.canvas.mapTool() is self.tool:
+                self.canvas.unsetMapTool(self.tool)
+            self.canvas.scene().removeItem(self.item)
+        except Exception:
+            pass
+        self.item = None
+        self.tool = None
+
+    def closeEvent(self, event):
+        if self.btn_edit.isChecked():
+            self.btn_edit.setChecked(False)
+        super().closeEvent(event)

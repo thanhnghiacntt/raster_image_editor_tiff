@@ -1,0 +1,19 @@
+[general]
+name=Raster Image Editor Tiff
+qgisMinimumVersion=3.16
+description=Đưa ảnh thường (PNG/JPG/TIF) vào bản đồ, kéo - xoay - co giãn để khớp đúng tọa độ rồi xuất ra GeoTIFF.
+about=Plugin cho phép nạp một ảnh chưa có tọa độ lên canvas QGIS, chỉnh vị trí bằng cách kéo chuột (di chuyển, kéo bất kỳ điểm nào trên cạnh để co giãn riêng theo X hoặc Y, kéo góc để co giãn cả hai trục, xoay), hoàn tác/làm lại bằng Ctrl+Z và Ctrl+Y, hoặc căn chính xác bằng 2 điểm khống chế, hoặc nhập trực tiếp tọa độ tâm / kích thước pixel / góc xoay. Sau khi khớp, ảnh được xuất ra file GeoTIFF theo CRS của dự án (kèm tùy chọn world file, nén, xoay về hướng Bắc, tạo overview), hoặc cắt thành bộ tile Web Mercator dạng thư mục z/x/y, ZIP hay MBTiles giống plugin QTiles.
+version=1.4.1
+author=Claude Code
+email=thanhnghiacntt@gmail.com
+
+tracker=https://example.com/geo-image-aligner/issues
+repository=https://example.com/geo-image-aligner
+homepage=https://example.com/geo-image-aligner
+
+tags=raster,georeference,geotiff,image,align,warp,tile,xyz,mbtiles,tms,leaflet,tọa độ
+category=Raster
+icon=icons/logo.png
+experimental=False
+deprecated=False
+hasProcessingProvider=no
