@@ -4,27 +4,38 @@
 import os
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QImage, QKeySequence
+from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
-from qgis.core import Qgis, QgsProject
+from qgis.core import Qgis, QgsCoordinateReferenceSystem, QgsProject
+from qgis.gui import QgsProjectionSelectionWidget
 
 try:                                     # Qt5
     from qgis.PyQt.QtWidgets import QShortcut
 except ImportError:                      # Qt6
     from qgis.PyQt.QtGui import QShortcut
 
+from . import georef
 from .exporter import COMPRESSIONS, RESAMPLE_ALGS, export_geotiff
 from .maptool import TP_DONE, TP_MESSAGES, AlignImageMapTool
 from .overlay import ImageOverlayItem
 from .placement import Placement
 from .resources import plugin_icon
 
-IMAGE_FILTER = ("Ảnh (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp);;"
+IMAGE_FILTER = ("Ảnh & raster (*.png *.jpg *.jpeg *.tif *.tiff *.gtif *.jp2 *.bmp "
+                "*.gif *.webp *.img *.vrt);;"
+                "GeoTIFF (*.tif *.tiff *.gtif);;"
                 "Tất cả các file (*.*)")
+QUICK_CRS = ('EPSG:4326', 'EPSG:3857')
+
+
+def crs_name(crs):
+    if crs is None or not crs.isValid():
+        return "không xác định"
+    return crs.authid() or crs.description() or "hệ tự định nghĩa"
 MAX_UNDO = 60
 
 
@@ -47,10 +58,18 @@ class RasterImageEditorTiffDock(QDockWidget):
         self._undo = []
         self._redo = []
         self._image_path = None
+        self._loading = False          # đang nạp ảnh -> bỏ qua sự kiện đổi CRS
+        self._northup_user = False     # lựa chọn "nắn thẳng" của người dùng
+        self.item.placement_crs = self._map_crs()
+        # Có thể thay khi chạy tự động/kiểm thử để khỏi bật hộp thoại hỏi.
+        self.ask_georef_choice = self._ask_georef_choice
 
         self._build_ui()
         self._connect()
         self._build_shortcuts()
+        self.crs_out.setCrs(self._map_crs())
+        self._refresh_crs_label()
+        self._on_out_crs_changed()
         self._update_enabled()
 
     # ------------------------------------------------------------------- UI
@@ -116,7 +135,13 @@ class RasterImageEditorTiffDock(QDockWidget):
 
         # --- 3. Tọa độ ----------------------------------------------------
         g_geo = QGroupBox("3. Tọa độ & kích thước")
-        grid = QGridLayout(g_geo)
+        v_geo = QVBoxLayout(g_geo)
+        self.lbl_crs = QLabel("Hệ tọa độ của bản đồ: —")
+        self.lbl_crs.setWordWrap(True)
+        self.lbl_crs.setStyleSheet("color:#666;")
+        v_geo.addWidget(self.lbl_crs)
+        grid = QGridLayout()
+        v_geo.addLayout(grid)
         grid.setColumnStretch(1, 1)
 
         self.sp_cx = self._coord_spin()
@@ -178,9 +203,32 @@ class RasterImageEditorTiffDock(QDockWidget):
         g_out = QGroupBox("4. Xuất GeoTIFF")
         l_out = QVBoxLayout(g_out)
 
-        self.lbl_crs = QLabel("Hệ tọa độ: —")
-        self.lbl_crs.setWordWrap(True)
-        l_out.addWidget(self.lbl_crs)
+        l_out.addWidget(QLabel("Hệ tọa độ của file xuất ra:"))
+        self.crs_out = QgsProjectionSelectionWidget()
+        try:
+            self.crs_out.setOptionVisible(QgsProjectionSelectionWidget.ProjectCrs, True)
+        except AttributeError:
+            pass
+        self.crs_out.setToolTip("Chọn chuẩn tọa độ cho GeoTIFF, ví dụ EPSG:4326 (WGS 84 "
+                                "kinh/vĩ độ), EPSG:3857 (Web Mercator), VN-2000…")
+        l_out.addWidget(self.crs_out)
+
+        row_crs = QHBoxLayout()
+        self.btn_crs_map = QPushButton("Theo bản đồ")
+        self.btn_crs_map.setToolTip("Dùng đúng hệ tọa độ đang hiển thị bản đồ")
+        row_crs.addWidget(self.btn_crs_map)
+        self.btn_crs_quick = []
+        for code in QUICK_CRS:
+            btn = QPushButton(code)
+            btn.setToolTip(QgsCoordinateReferenceSystem(code).description())
+            row_crs.addWidget(btn)
+            self.btn_crs_quick.append((btn, code))
+        l_out.addLayout(row_crs)
+
+        self.lbl_crs_note = QLabel("")
+        self.lbl_crs_note.setWordWrap(True)
+        self.lbl_crs_note.setStyleSheet("color:#666; font-size:11px;")
+        l_out.addWidget(self.lbl_crs_note)
 
         row4 = QHBoxLayout()
         self.ed_output = QLineEdit()
@@ -290,7 +338,12 @@ class RasterImageEditorTiffDock(QDockWidget):
         self.btn_export.clicked.connect(self.do_export)
         self.btn_tiles.clicked.connect(self.open_tile_dialog)
         self.cmb_comp.currentTextChanged.connect(self._on_comp_changed)
-        self.cb_northup.toggled.connect(self.cmb_resample.setEnabled)
+        self.cb_northup.toggled.connect(self._on_northup_toggled)
+        self.crs_out.crsChanged.connect(self._on_out_crs_changed)
+        self.btn_crs_map.clicked.connect(lambda: self.crs_out.setCrs(self._map_crs()))
+        for btn, code in self.btn_crs_quick:
+            btn.clicked.connect(
+                lambda _=False, c=code: self.crs_out.setCrs(QgsCoordinateReferenceSystem(c)))
         self.cb_lock.toggled.connect(self._on_lock_changed)
         self.cb_show_image.toggled.connect(self._on_show_image)
         self.sl_opacity.valueChanged.connect(self._on_opacity)
@@ -307,6 +360,7 @@ class RasterImageEditorTiffDock(QDockWidget):
         self.tool.twoPointStep.connect(self._on_two_point_step)
         self.tool.twoPointFinished.connect(self._on_two_point_finished)
         self.canvas.mapToolSet.connect(self._on_map_tool_set)
+        self.canvas.destinationCrsChanged.connect(self._on_map_crs_changed)
         QgsProject.instance().crsChanged.connect(self._refresh_crs_label)
 
     def _build_shortcuts(self):
@@ -349,10 +403,38 @@ class RasterImageEditorTiffDock(QDockWidget):
         if not path or not os.path.isfile(path):
             self._msg("Không tìm thấy file ảnh.", Qgis.Warning)
             return
-        image = QImage(path)
-        if image.isNull():
-            self._msg("Không đọc được ảnh (định dạng không hỗ trợ?).", Qgis.Critical)
+        try:
+            src = georef.read_raster(path)
+        except Exception as exc:
+            self._msg(str(exc), Qgis.Critical)
             return
+
+        image = src.image
+        notes = list(src.notes)
+        placement = None
+        placement_crs = self._map_crs()
+        file_crs = None
+        exact = True
+
+        if src.is_georeferenced:
+            self._loading = True
+            try:
+                result = self._place_georeferenced(src, notes)
+            except Exception as exc:
+                result = None
+                notes.append("Không đặt được theo tọa độ trong file (%s) — ảnh được "
+                             "đặt giữa khung nhìn." % exc)
+            finally:
+                self._loading = False
+            if result == 'cancel':
+                return
+            if result is not None:
+                image, placement, placement_crs, file_crs, exact = result
+
+        georeferenced = placement is not None
+        if placement is None:
+            placement = Placement.fit_in_extent(self.canvas.extent(),
+                                                image.width(), image.height())
 
         self._image_path = path
         self._undo = []
@@ -361,27 +443,124 @@ class RasterImageEditorTiffDock(QDockWidget):
         self.cb_show_image.setChecked(True)
         self.item.set_image_visible(True)
         self.item.set_image(image)
-        placement = Placement.fit_in_extent(self.canvas.extent(),
-                                            image.width(), image.height())
         self.item.set_placement(placement)
+        self._placement_crs = placement_crs
         self._aspect = placement.aspect
 
-        self.lbl_info.setText("%s — %d × %d pixel"
-                              % (os.path.basename(path), image.width(), image.height()))
+        info = "%s — %d × %d pixel" % (os.path.basename(path), image.width(),
+                                       image.height())
+        if georeferenced:
+            info += "\nCó sẵn tọa độ: %s" % crs_name(file_crs or placement_crs)
+        self.lbl_info.setText(info)
         if not self.ed_output.text().strip():
             base = os.path.splitext(path)[0]
             self.ed_output.setText(base + "_georef.tif")
+        if file_crs is not None:
+            # Mặc định xuất lại đúng hệ tọa độ của file gốc.
+            self.crs_out.setCrs(file_crs)
 
         self._refresh_crs_label()
         self._refresh_fields()
+        self._on_out_crs_changed()
         self._update_enabled()
         self.btn_edit.setChecked(True)
-        self._msg("Đã nạp ảnh. Kéo/chỉnh trên bản đồ rồi bấm XUẤT GEOTIFF.", Qgis.Info)
+
+        if georeferenced:
+            self.zoom_to_image()
+            head = ("Đã đặt ảnh ĐÚNG VỊ TRÍ theo tọa độ trong file." if exact
+                    else "Đã đặt ảnh GẦN ĐÚNG theo tọa độ trong file.")
+        else:
+            head = "Đã nạp ảnh. Kéo/chỉnh trên bản đồ rồi bấm XUẤT GEOTIFF."
+        level = (Qgis.Success if (georeferenced and exact and not notes)
+                 else Qgis.Warning if (georeferenced and not exact) else Qgis.Info)
+        self._msg(" ".join([head] + notes), level, 8 if notes else 5)
+
+    def _place_georeferenced(self, src, notes):
+        """Tính vị trí ảnh từ GeoTransform/CRS trong file.
+
+        Trả về (ảnh, placement, crs_của_placement, crs_của_file, chính_xác) hoặc
+        'cancel'.
+        """
+        map_crs = self._map_crs()
+        image, gt, flipped = georef.normalize_orientation(src.image, src.geotransform)
+        if flipped:
+            notes.append("File lưu ảnh theo chiều từ dưới lên — đã lật lại cho đúng.")
+        if src.georef_kind == 'gcps':
+            notes.append("Vị trí lấy từ các điểm khống chế (GCP) trong file.")
+
+        file_crs = src.crs
+        if file_crs is None:
+            file_crs = map_crs
+            notes.append("File không kèm hệ tọa độ — coi như cùng hệ %s với bản đồ."
+                         % crs_name(map_crs))
+        same_crs = (not file_crs.isValid() or not map_crs.isValid()
+                    or file_crs == map_crs)
+
+        w, h = image.width(), image.height()
+        placement, err = georef.fit_placement(gt, w, h, file_crs, map_crs)
+        if err <= georef.GEOREF_TOLERANCE_PX:
+            if not same_crs:
+                notes.append("Đã quy đổi từ %s sang %s của bản đồ (lệch tối đa %.2f "
+                             "pixel)." % (crs_name(file_crs), crs_name(map_crs), err))
+            return image, placement, map_crs, src.crs, True
+
+        choice = 'warp' if same_crs else self.ask_georef_choice(file_crs, map_crs, err)
+        if choice == 'cancel':
+            return 'cancel'
+        if choice == 'approx':
+            notes.append("Đặt gần đúng: lệch tối đa khoảng %.1f pixel so với tọa độ "
+                         "thật." % err)
+            return image, placement, map_crs, src.crs, False
+        if choice == 'project':
+            self._set_map_crs(file_crs)
+            map_crs = file_crs
+            notes.append("Đã đổi hệ tọa độ dự án sang %s." % crs_name(file_crs))
+            placement, err = georef.fit_placement(gt, w, h, file_crs, file_crs)
+            if err <= georef.GEOREF_TOLERANCE_PX:
+                return image, placement, map_crs, src.crs, True
+            same_crs = True
+
+        image, gt2 = georef.warp_to_crs(image, gt, file_crs, map_crs,
+                                        resample=self.cmb_resample.currentText())
+        placement, err = georef.fit_placement(gt2, image.width(), image.height(),
+                                              map_crs, map_crs)
+        if same_crs:
+            notes.append("Ảnh trong file bị xiên — đã nắn thẳng để đặt chính xác.")
+        else:
+            notes.append("Đã chiếu lại ảnh từ %s sang %s để đặt chính xác."
+                         % (crs_name(file_crs), crs_name(map_crs)))
+        return image, placement, map_crs, src.crs, True
+
+    def _ask_georef_choice(self, file_crs, map_crs, err_px):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Ảnh dùng hệ tọa độ khác bản đồ")
+        box.setText("Ảnh dùng %s, còn bản đồ đang dùng %s.\n"
+                    "Nếu đặt thẳng lên bản đồ, vị trí sẽ lệch tối đa khoảng "
+                    "%.1f pixel ảnh." % (crs_name(file_crs), crs_name(map_crs), err_px))
+        box.setInformativeText("Chọn cách đưa ảnh vào bản đồ:")
+        b_warp = box.addButton("Chiếu lại ảnh sang %s (khuyên dùng)" % crs_name(map_crs),
+                               QMessageBox.AcceptRole)
+        b_proj = box.addButton("Đổi hệ tọa độ dự án sang %s" % crs_name(file_crs),
+                               QMessageBox.AcceptRole)
+        b_approx = box.addButton("Đặt gần đúng", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(b_warp)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_warp:
+            return 'warp'
+        if clicked is b_proj:
+            return 'project'
+        if clicked is b_approx:
+            return 'approx'
+        return 'cancel'
 
     def clear_image(self):
         self.tool.stop_two_point()
         self.item.set_image(None)
         self.item.set_placement(None)
+        self._placement_crs = self._map_crs()
         self._image_path = None
         self._undo = []
         self._redo = []
@@ -437,16 +616,98 @@ class RasterImageEditorTiffDock(QDockWidget):
         self._msg(message, Qgis.Success if ok else Qgis.Warning)
         self._refresh_fields()
 
+    # ------------------------------------------------------------- hệ tọa độ
+    def _map_crs(self):
+        """Hệ tọa độ đang hiển thị bản đồ — cũng là hệ của các ô tọa độ ở mục 3."""
+        crs = self.canvas.mapSettings().destinationCrs()
+        if not crs.isValid():
+            crs = QgsProject.instance().crs()
+        return crs
+
+    @property
+    def _placement_crs(self):
+        return getattr(self.item, 'placement_crs', None) if self.item is not None else None
+
+    @_placement_crs.setter
+    def _placement_crs(self, crs):
+        if self.item is not None:
+            self.item.placement_crs = crs
+
+    def _set_map_crs(self, crs):
+        QgsProject.instance().setCrs(crs)
+        if self.canvas.mapSettings().destinationCrs() != crs:
+            self.canvas.setDestinationCrs(crs)
+
+    def _on_map_crs_changed(self, *args):
+        """Bản đồ đổi hệ tọa độ: dời ảnh theo để vẫn nằm đúng chỗ ngoài thực địa."""
+        if self.item is None:
+            return
+        new = self._map_crs()
+        old = self._placement_crs
+        follow_out = (old is not None and old.isValid()
+                      and self.crs_out.crs() == old)
+        if (not self._loading and self.item.has_image() and old is not None
+                and old.isValid() and new.isValid() and old != new):
+            try:
+                placement, err = georef.placement_to_crs(self.item.placement, old, new)
+                self._undo = [self._convert_state(d, old, new) for d in self._undo]
+                self._redo = [self._convert_state(d, old, new) for d in self._redo]
+                self.item.set_placement(placement)
+                if self.cb_lock.isChecked():
+                    self._aspect = placement.aspect
+                if err > georef.GEOREF_TOLERANCE_PX:
+                    self._msg("Bản đồ đổi sang %s: ảnh đã được dời theo, lệch tối đa "
+                              "khoảng %.1f pixel." % (crs_name(new), err), Qgis.Warning)
+            except Exception as exc:
+                self._msg("Không quy đổi được vị trí ảnh sang %s: %s"
+                          % (crs_name(new), exc), Qgis.Warning)
+        if not self._loading:
+            self._placement_crs = new
+        if follow_out:
+            self.crs_out.setCrs(new)
+        self._refresh_crs_label()
+        self._refresh_fields()
+        self._on_out_crs_changed()
+        self._update_history_buttons()
+
+    @staticmethod
+    def _convert_state(state, old, new):
+        placement, _ = georef.placement_to_crs(Placement.from_dict(state), old, new)
+        return placement.to_dict()
+
+    def _on_northup_toggled(self, checked):
+        if self.cb_northup.isEnabled():
+            self._northup_user = checked
+        self.cmb_resample.setEnabled(checked or not self.cb_northup.isEnabled())
+
+    def _on_out_crs_changed(self, *args):
+        out = self.crs_out.crs()
+        src = self._placement_crs if self._placement_crs is not None else self._map_crs()
+        differs = out.isValid() and src.isValid() and out != src
+        self.cb_northup.blockSignals(True)
+        if differs:
+            self.cb_northup.setChecked(True)
+            self.cb_northup.setEnabled(False)
+            self.lbl_crs_note.setText(
+                "Khác hệ của bản đồ (%s): ảnh sẽ được chiếu lại sang %s — luôn thẳng "
+                "hướng Bắc và nội suy theo thuật toán chọn bên dưới."
+                % (crs_name(src), crs_name(out)))
+        else:
+            self.cb_northup.setEnabled(True)
+            self.cb_northup.setChecked(self._northup_user)
+            self.lbl_crs_note.setText(
+                "Trùng hệ của bản đồ: góc xoay được ghi thẳng vào GeoTIFF, không nội "
+                "suy lại ảnh.")
+        self.cb_northup.blockSignals(False)
+        self.cmb_resample.setEnabled(differs or self.cb_northup.isChecked())
+
     # ------------------------------------------------------------ đồng bộ UI
     def _refresh_crs_label(self):
-        crs = QgsProject.instance().crs()
-        self.lbl_crs.setText("Hệ tọa độ xuất ra (theo dự án): %s"
-                             % (crs.authid() or crs.description() or "không xác định"))
-        p = self.item.placement
-        if p is not None:
-            geographic = crs.isGeographic()
-            for sp in (self.sp_px, self.sp_py):
-                sp.setSingleStep(1e-6 if geographic else 0.01)
+        crs = self._map_crs()
+        self.lbl_crs.setText("Tọa độ bên dưới theo hệ của bản đồ: %s" % crs_name(crs))
+        geographic = crs.isValid() and crs.isGeographic()
+        for sp in (self.sp_px, self.sp_py):
+            sp.setSingleStep(1e-6 if geographic else 0.01)
 
     def _refresh_fields(self):
         p = self.item.placement
@@ -461,7 +722,7 @@ class RasterImageEditorTiffDock(QDockWidget):
             self.sp_rot.setValue(p.rotation)
         finally:
             self._syncing = False
-        units = QgsProject.instance().crs().isGeographic() and "°" or "đvbđ"
+        units = "°" if self._map_crs().isGeographic() else "đvbđ"
         self.lbl_span.setText("%.4f × %.4f %s"
                               % (p.width * p.sx, p.height * p.sy, units))
 
@@ -609,15 +870,19 @@ class RasterImageEditorTiffDock(QDockWidget):
         if not out_path.lower().endswith(('.tif', '.tiff')):
             out_path += '.tif'
 
-        crs = QgsProject.instance().crs()
+        crs = self._placement_crs if self._placement_crs is not None else self._map_crs()
         if not crs.isValid():
-            self._msg("Dự án chưa có hệ tọa độ hợp lệ.", Qgis.Critical)
+            self._msg("Bản đồ chưa có hệ tọa độ hợp lệ.", Qgis.Critical)
             return
+        dst_crs = self.crs_out.crs()
+        if not dst_crs.isValid():
+            dst_crs = crs
 
         self.setCursor(Qt.WaitCursor)
         try:
             export_geotiff(
                 self.item.image, self.item.placement, crs, out_path,
+                dst_crs=dst_crs,
                 compression=self.cmb_comp.currentText(),
                 jpeg_quality=self.sp_quality.value(),
                 north_up=self.cb_northup.isChecked(),
@@ -638,7 +903,8 @@ class RasterImageEditorTiffDock(QDockWidget):
             if layer is None or not layer.isValid():
                 self._msg("Đã xuất file nhưng không thêm được vào bản đồ.",
                           Qgis.Warning)
-        self._msg("Đã xuất GeoTIFF: %s" % out_path, Qgis.Success, 8)
+        self._msg("Đã xuất GeoTIFF theo %s: %s" % (crs_name(dst_crs), out_path),
+                  Qgis.Success, 8)
 
     # -------------------------------------------------------------- xuất tile
     def open_tile_dialog(self):

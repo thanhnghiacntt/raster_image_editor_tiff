@@ -196,12 +196,27 @@ class TileExportDialog(QDialog):
                 return ext
         return self.canvas.extent()
 
+    def _map_crs(self):
+        crs = self.canvas.mapSettings().destinationCrs()
+        return crs if crs.isValid() else QgsProject.instance().crs()
+
+    def _image_crs(self):
+        crs = getattr(self.item, 'placement_crs', None)
+        return crs if (crs is not None and crs.isValid()) else self._map_crs()
+
+    def _extent_crs(self):
+        """Hệ tọa độ của phạm vi trả về bởi `_project_extent()`."""
+        if (self.extent_mode() == 'image' and self.item is not None
+                and self.item.has_image()):
+            return self._image_crs()
+        return self._map_crs()
+
     def _extent_3857(self):
         ext = self._project_extent()
         if ext is None or ext.isEmpty():
             ext = QgsRectangle(-T.ORIGIN, -T.ORIGIN, T.ORIGIN, T.ORIGIN)
             return T.clamp_mercator(ext)
-        return T.to_mercator(ext, QgsProject.instance().crs())
+        return T.to_mercator(ext, self._extent_crs())
 
     def _source_pixel_size_3857(self, extent_3857):
         """Kích thước 1 pixel ảnh quy đổi ra mét ở Web Mercator."""
@@ -276,7 +291,7 @@ class TileExportDialog(QDialog):
         self._temp_dir = tempfile.mkdtemp(prefix='riet_tiles_')
         path = os.path.join(self._temp_dir, 'aligned.tif')
         export_geotiff(self.item.image, self.item.placement,
-                       QgsProject.instance().crs(), path,
+                       self._image_crs(), path,
                        compression='DEFLATE', north_up=False,
                        keep_alpha=True, build_overviews=True, world_file=False)
         layer = QgsRasterLayer(path, 'aligned_image')
@@ -319,7 +334,7 @@ class TileExportDialog(QDialog):
         return path, extent, total
 
     def build_metadata(self, tms):
-        wgs = T.to_wgs84(self._project_extent(), QgsProject.instance().crs())
+        wgs = T.to_wgs84(self._project_extent(), self._extent_crs())
         fmt = self.cmb_format.currentText()
         return {
             'name': self.ed_name.text().strip() or 'tiles',
