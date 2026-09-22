@@ -2,7 +2,7 @@
 """Item vẽ ảnh lên canvas của QGIS kèm các tay nắm (handle) để chỉnh."""
 
 from qgis.PyQt.QtCore import QPointF, QRectF, Qt
-from qgis.PyQt.QtGui import QBrush, QColor, QPainter, QPen, QTransform
+from qgis.PyQt.QtGui import QBrush, QColor, QFont, QPainter, QPen, QTransform
 from qgis.gui import QgsMapCanvasItem
 
 HANDLE_SIZE = 9          # cạnh hình vuông tay nắm (pixel màn hình)
@@ -29,6 +29,7 @@ MAX_PREVIEW_PX = 2600    # ảnh lớn hơn sẽ được thu nhỏ để vẽ c
 
 COL_OUTLINE = QColor(255, 40, 40)
 COL_HOVER = QColor(0, 150, 255)
+COL_OTHER = QColor(255, 210, 0)       # khung các ảnh không được chọn
 
 
 def _clip_segment(p0, p1, rect):
@@ -81,8 +82,20 @@ class ImageOverlayItem(QgsMapCanvasItem):
         self.show_handles = True
         self.show_image = True     # tắt để so sánh với nền bên dưới
         self.hover = None          # tên tay nắm con trỏ đang rê tới
+        # False khi có FrameOverlayItem vẽ khung/tay nắm lên trên mọi ảnh.
+        self.draw_decorations = True
+        self.label = ''            # tên hiện cạnh khung khi có nhiều ảnh
+        self.listeners = []        # hàm gọi lại mỗi khi ảnh đổi (để vẽ lại khung)
         self.setZValue(1000)
         self.setPos(QPointF(0, 0))
+
+    def _notify(self):
+        self.update()
+        for fn in list(self.listeners):
+            try:
+                fn()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ nạp ảnh
     def set_image(self, image):
@@ -96,31 +109,31 @@ class ImageOverlayItem(QgsMapCanvasItem):
         else:
             self._preview = image
         self.prepareGeometryChange()
-        self.update()
+        self._notify()
 
     def set_placement(self, placement):
         self.placement = placement
         self.prepareGeometryChange()
-        self.update()
+        self._notify()
 
     def set_opacity_value(self, value):
         self.image_opacity = max(0.0, min(1.0, float(value)))
-        self.update()
+        self._notify()
 
     def set_show_handles(self, state):
         self.show_handles = bool(state)
-        self.update()
+        self._notify()
 
     def set_image_visible(self, state):
         """Bật/tắt phần ảnh; khung viền và tay nắm vẫn giữ nguyên."""
         if bool(state) != self.show_image:
             self.show_image = bool(state)
-            self.update()
+            self._notify()
 
     def set_hover(self, name):
         if name != self.hover:
             self.hover = name
-            self.update()
+            self._notify()
 
     def has_image(self):
         return self.image is not None and self.placement is not None
@@ -237,25 +250,78 @@ class ImageOverlayItem(QgsMapCanvasItem):
 
     # ----------------------------------------------------------------- vẽ hình
     def paint(self, painter, option=None, widget=None):
-        if self._preview is None or self.placement is None:
+        self.paint_image(painter)
+        if self.draw_decorations:
+            self.paint_decorations(painter)
+
+    def paint_image(self, painter):
+        if self._preview is None or self.placement is None or not self.show_image:
             return
         corners = self.canvas_corners()
         if corners is None:
             return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setOpacity(self.image_opacity)
+        painter.setTransform(
+            self._image_transform(corners, self._preview.width(),
+                                  self._preview.height()),
+            True)
+        painter.drawImage(QPointF(0, 0), self._preview)
+        painter.restore()
 
-        if self.show_image:
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            painter.setOpacity(self.image_opacity)
-            painter.setTransform(
-                self._image_transform(corners, self._preview.width(),
-                                      self._preview.height()),
-                True)
-            painter.drawImage(QPointF(0, 0), self._preview)
-            painter.restore()
+    def paint_outline(self, painter):
+        """Khung mảnh nét đứt + nhãn tên, dùng cho các ảnh không được chọn."""
+        corners = self.canvas_corners() if self.placement is not None else None
+        if not corners or self._preview is None:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setOpacity(1.0)
+        painter.setBrush(Qt.NoBrush)
+        under = QPen(QColor(0, 0, 0, 160), 3)
+        under.setCosmetic(True)
+        painter.setPen(under)
+        painter.drawPolygon(*corners)
+        pen = QPen(COL_OTHER, 1.5, Qt.DashLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawPolygon(*corners)
+        painter.restore()
+        self.paint_label(painter, COL_OTHER)
 
-        if not self.show_handles:
+    def paint_label(self, painter, color):
+        if not self.label:
+            return
+        corners = self.canvas_corners()
+        if not corners:
+            return
+        # Đặt nhãn phía TRÊN góc cao nhất trên màn hình, nằm ngoài ảnh để không
+        # che mất chi tiết đang cần căn.
+        anchor = min(corners, key=lambda c: (c.y(), c.x()))
+        painter.save()
+        font = QFont()
+        font.setPointSizeF(9)
+        font.setBold(True)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        w = fm.boundingRect(self.label).width()
+        h = fm.height() + 4
+        box = QRectF(anchor.x() - 4, anchor.y() - h - 6, w + 10, h)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
+        painter.drawRoundedRect(box, 3, 3)
+        painter.setPen(QPen(color))
+        painter.drawText(box, Qt.AlignCenter, self.label)
+        painter.restore()
+
+    def paint_decorations(self, painter):
+        """Khung đỏ, tay nắm, nút xoay của ảnh đang được chỉnh."""
+        if not self.show_handles or self._preview is None or self.placement is None:
+            return
+        corners = self.canvas_corners()
+        if corners is None:
             return
 
         painter.save()
@@ -302,6 +368,7 @@ class ImageOverlayItem(QgsMapCanvasItem):
             painter.drawEllipse(handles['rot'], half + (3 if active else 1),
                                 half + (3 if active else 1))
         painter.restore()
+        self.paint_label(painter, COL_OUTLINE)
 
     # ------------------------------------------------------------ bắt sự kiện
     def hit_test(self, canvas_pt):
@@ -352,6 +419,10 @@ class ImageOverlayItem(QgsMapCanvasItem):
 
         return 'body' if self._point_inside(canvas_pt) else None
 
+    def contains(self, canvas_pt):
+        """Điểm trên canvas có nằm trong ảnh không (không phụ thuộc tay nắm)."""
+        return self.has_image() and self._point_inside(canvas_pt)
+
     def _point_inside(self, pt):
         corners = self.canvas_corners()
         if not corners:
@@ -371,3 +442,38 @@ class ImageOverlayItem(QgsMapCanvasItem):
             elif s != sign:
                 return False
         return True
+
+
+class FrameOverlayItem(QgsMapCanvasItem):
+    """Vẽ khung + tay nắm của mọi ảnh lên TRÊN CÙNG.
+
+    Khi nhiều ảnh chồng nhau, tay nắm của ảnh đang chọn sẽ bị ảnh nằm trên che
+    mất nếu vẽ chung với ảnh; item này luôn ở trên nên tay nắm luôn nhìn thấy.
+    `items_provider()` trả về danh sách (item, đang_chọn).
+    """
+
+    def __init__(self, canvas, items_provider):
+        super().__init__(canvas)
+        self._canvas = canvas
+        self.items_provider = items_provider
+        self.setZValue(5000)
+        self.setPos(QPointF(0, 0))
+
+    def boundingRect(self):
+        rect = QRectF(0, 0, self._canvas.width(), self._canvas.height())
+        return rect.adjusted(-80, -80, 80, 80).translated(-self.pos())
+
+    def updatePosition(self):
+        self.setPos(QPointF(0, 0))
+        self.prepareGeometryChange()
+        self.update()
+
+    def paint(self, painter, option=None, widget=None):
+        entries = list(self.items_provider())
+        active = [it for it, is_active in entries if is_active]
+        if not active or not active[0].show_handles:
+            return
+        for it, is_active in entries:
+            if not is_active and it.has_image():
+                it.paint_outline(painter)
+        active[0].paint_decorations(painter)

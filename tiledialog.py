@@ -18,12 +18,12 @@ from .exporter import export_geotiff
 from .resources import plugin_icon
 
 SOURCES = [
-    ("Chỉ ảnh đang căn", T.SRC_IMAGE),
-    ("Ảnh đang căn + các lớp đang hiện", T.SRC_IMAGE_LAYERS),
+    ("Các ảnh đang căn (đang hiện)", T.SRC_IMAGE),
+    ("Các ảnh đang căn + các lớp đang hiện", T.SRC_IMAGE_LAYERS),
     ("Chỉ các lớp đang hiện trên bản đồ", T.SRC_LAYERS),
 ]
 EXTENTS = [
-    ("Theo phạm vi ảnh", 'image'),
+    ("Theo phạm vi các ảnh", 'image'),
     ("Theo khung nhìn hiện tại", 'canvas'),
     ("Toàn bộ các lớp trên bản đồ", 'full'),
 ]
@@ -36,13 +36,16 @@ WARN_TILE_COUNT = 60000
 
 
 class TileExportDialog(QDialog):
-    def __init__(self, iface, item, parent=None):
+    def __init__(self, iface, item, parent=None, items=None):
         super().__init__(parent)
         self.iface = iface
         self.canvas = iface.mapCanvas()
-        self.item = item
+        self.item = item                 # ảnh đang chọn (lấy tên mặc định, CRS)
+        # Các ảnh đưa vào tile, phần tử đầu nằm trên cùng.
+        pool = items if items is not None else [item]
+        self.items = [it for it in pool if it is not None and it.has_image()]
         self._temp_dir = None
-        self._temp_layer = None
+        self._temp_layers = []
         self.show_progress = True     # tắt khi chạy tự động / kiểm thử
 
         self.setWindowTitle("Xuất bộ tile (XYZ / MBTiles)")
@@ -151,8 +154,7 @@ class TileExportDialog(QDialog):
 
     # -------------------------------------------------------------- mặc định
     def _apply_defaults(self):
-        has_image = self.item is not None and self.item.has_image()
-        if not has_image:
+        if not self.items:
             self.cmb_source.setCurrentIndex(2)          # chỉ các lớp
             for i in (0, 1):
                 self.cmb_source.model().item(i).setEnabled(False)
@@ -188,8 +190,11 @@ class TileExportDialog(QDialog):
 
     def _project_extent(self):
         mode = self.extent_mode()
-        if mode == 'image' and self.item is not None and self.item.has_image():
-            return self.item.placement.bbox()
+        if mode == 'image' and self.items:
+            ext = QgsRectangle(self.items[0].placement.bbox())
+            for it in self.items[1:]:
+                ext.combineExtentWith(it.placement.bbox())
+            return ext
         if mode == 'full':
             ext = self.canvas.fullExtent()
             if ext is not None and not ext.isEmpty():
@@ -206,8 +211,7 @@ class TileExportDialog(QDialog):
 
     def _extent_crs(self):
         """Hệ tọa độ của phạm vi trả về bởi `_project_extent()`."""
-        if (self.extent_mode() == 'image' and self.item is not None
-                and self.item.has_image()):
+        if self.extent_mode() == 'image' and self.items:
             return self._image_crs()
         return self._map_crs()
 
@@ -219,14 +223,15 @@ class TileExportDialog(QDialog):
         return T.to_mercator(ext, self._extent_crs())
 
     def _source_pixel_size_3857(self, extent_3857):
-        """Kích thước 1 pixel ảnh quy đổi ra mét ở Web Mercator."""
-        if self.item is None or not self.item.has_image():
-            return None
-        p = self.item.placement
-        if p.width <= 0:
-            return None
-        return max(extent_3857.width() / float(p.width),
-                   extent_3857.height() / float(p.height))
+        """Kích thước 1 pixel ảnh (mịn nhất trong các ảnh) quy ra mét Web Mercator."""
+        sizes = []
+        for it in self.items:
+            p = it.placement
+            if p.width <= 0 or p.height <= 0:
+                continue
+            ext = T.to_mercator(p.bbox(), self._image_crs())
+            sizes.append(max(ext.width() / float(p.width), ext.height() / float(p.height)))
+        return min(sizes) if sizes else None
 
     # ------------------------------------------------------------------ UI ph
     def _on_output_changed(self):
@@ -281,27 +286,31 @@ class TileExportDialog(QDialog):
         mode = self.source_mode()
         layers = []
         if mode in (T.SRC_IMAGE, T.SRC_IMAGE_LAYERS):
-            layers.append(self._bake_image_layer())
+            layers.extend(self._bake_image_layers())
         if mode in (T.SRC_LAYERS, T.SRC_IMAGE_LAYERS):
             layers.extend(self.canvas.layers())
         return layers
 
-    def _bake_image_layer(self):
-        """Ghi ảnh đã căn ra GeoTIFF tạm rồi nạp thành lớp raster để vẽ."""
+    def _bake_image_layers(self):
+        """Ghi từng ảnh đã căn ra GeoTIFF tạm rồi nạp thành lớp raster để vẽ."""
+        if not self.items:
+            return []
         self._temp_dir = tempfile.mkdtemp(prefix='riet_tiles_')
-        path = os.path.join(self._temp_dir, 'aligned.tif')
-        export_geotiff(self.item.image, self.item.placement,
-                       self._image_crs(), path,
-                       compression='DEFLATE', north_up=False,
-                       keep_alpha=True, build_overviews=True, world_file=False)
-        layer = QgsRasterLayer(path, 'aligned_image')
-        if not layer.isValid():
-            raise RuntimeError("Không tạo được lớp raster tạm từ ảnh đã căn.")
-        self._temp_layer = layer          # giữ tham chiếu để không bị thu hồi
-        return layer
+        layers = []
+        for i, it in enumerate(self.items):
+            path = os.path.join(self._temp_dir, 'aligned_%02d.tif' % i)
+            export_geotiff(it.image, it.placement, self._image_crs(), path,
+                           compression='DEFLATE', north_up=False,
+                           keep_alpha=True, build_overviews=True, world_file=False)
+            layer = QgsRasterLayer(path, 'aligned_image_%d' % i)
+            if not layer.isValid():
+                raise RuntimeError("Không tạo được lớp raster tạm từ ảnh đã căn.")
+            layers.append(layer)
+        self._temp_layers = layers        # giữ tham chiếu để không bị thu hồi
+        return layers
 
     def _cleanup_temp(self):
-        self._temp_layer = None
+        self._temp_layers = []
         if self._temp_dir and os.path.isdir(self._temp_dir):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
         self._temp_dir = None

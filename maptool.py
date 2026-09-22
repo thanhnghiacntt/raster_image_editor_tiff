@@ -30,6 +30,7 @@ class AlignImageMapTool(QgsMapTool):
     undoRequested = pyqtSignal()        # Ctrl+Z trên canvas
     redoRequested = pyqtSignal()        # Ctrl+Y / Ctrl+Shift+Z trên canvas
     peekChanged = pyqtSignal(bool)      # giữ H để tạm ẩn ảnh (True = đang ẩn)
+    activateRequested = pyqtSignal(object)  # bấm vào một ảnh khác -> chọn ảnh đó
     twoPointStep = pyqtSignal(int)      # đổi bước của chế độ căn 2 điểm
     twoPointFinished = pyqtSignal(bool, str)
 
@@ -38,6 +39,8 @@ class AlignImageMapTool(QgsMapTool):
         self.canvas = canvas
         self.item = item
         self.lock_aspect = True
+        # Hàm (điểm canvas) -> ImageOverlayItem khác nằm dưới con trỏ, hoặc None.
+        self.find_item_at = None
 
         self._mode = None               # 'move' | 'scale' | 'rotate'
         self._handle = None
@@ -54,6 +57,27 @@ class AlignImageMapTool(QgsMapTool):
         self._tp_img = [None, None]
         self._tp_map = [None, None]
         self._tp_markers = []
+
+    def set_item(self, item):
+        """Chuyển sang chỉnh ảnh khác (khi có nhiều ảnh)."""
+        if item is self.item:
+            return
+        editing = self.item.show_handles if self.item is not None else True
+        self._mode = None
+        self.stop_two_point()
+        self._stop_peek()
+        if self.item is not None:
+            self.item.set_hover(None)
+            self.item.set_show_handles(False)
+        self.item = item
+        if item is not None:
+            item.set_show_handles(editing)
+
+    def _other_item_at(self, pos):
+        if self.find_item_at is None:
+            return None
+        other = self.find_item_at(pos)
+        return other if (other is not None and other is not self.item) else None
 
     # --------------------------------------------------------------- vòng đời
     def activate(self):
@@ -194,7 +218,10 @@ class AlignImageMapTool(QgsMapTool):
             else:
                 hit = self.item.hit_test(event.pos())
                 self.item.set_hover(hit if hit != 'body' else None)
-                self._update_cursor(hit)
+                if hit is None and self._other_item_at(event.pos()) is not None:
+                    self.canvas.setCursor(QCursor(Qt.PointingHandCursor))
+                else:
+                    self._update_cursor(hit)
             return
 
         map_pt = QgsPointXY(self.toMapCoordinates(event.pos()))
@@ -207,7 +234,7 @@ class AlignImageMapTool(QgsMapTool):
         self.placementChanged.emit()
 
     def canvasPressEvent(self, event):
-        if not self.item.has_image():
+        if not self.item.has_image() and self.find_item_at is None:
             return
         if event.button() != Qt.LeftButton:
             return
@@ -215,9 +242,18 @@ class AlignImageMapTool(QgsMapTool):
             self._two_point_click(QgsPointXY(self._map_point(event)))
             return
 
-        handle = self.item.hit_test(event.pos())
+        handle = self.item.hit_test(event.pos()) if self.item.has_image() else None
         if handle is None:
-            return
+            # Bấm trúng một ảnh khác: chọn ảnh đó rồi kéo luôn.
+            other = self._other_item_at(event.pos())
+            if other is None:
+                return
+            self.activateRequested.emit(other)
+            if self.item is not other:
+                return
+            handle = self.item.hit_test(event.pos())
+            if handle is None:
+                return
         self.item.set_hover(handle if handle != 'body' else None)
         self._start_placement = self.item.placement.clone()
         self._start_map_pt = QgsPointXY(self.toMapCoordinates(event.pos()))

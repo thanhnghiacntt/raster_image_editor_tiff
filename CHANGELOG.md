@@ -1,5 +1,31 @@
 # Nhật ký thay đổi — Raster Image Editor Tiff
 
+## 1.2.0
+
+### Tính năng mới: làm việc với nhiều ảnh
+- Nạp nhiều ảnh (chọn nhiều file một lúc). Mục *1. Ảnh nguồn* có danh sách ảnh: chọn ảnh cần
+  chỉnh, ô đánh dấu hiện/ẩn, nút *Lên / Xuống* đổi thứ tự chồng, *Phóng tới*, *Gỡ ảnh*.
+- Bấm vào một ảnh trên bản đồ là chọn và kéo được ảnh đó ngay. Ảnh đang chọn có khung đỏ, tay nắm
+  luôn nổi trên cùng dù bị ảnh khác đè; ảnh khác có khung vàng nét đứt và nhãn số thứ tự.
+- Mỗi ảnh có vị trí, độ mờ, lịch sử hoàn tác (Ctrl+Z / Ctrl+Y) riêng.
+- Kiểu xuất mới ở mục *4*: ghép các ảnh đang hiện thành một GeoTIFF (mặc định từ ảnh thứ 2),
+  mỗi ảnh ra một file riêng, hoặc chỉ ảnh đang chọn.
+- Ghép ảnh: lưới chung thẳng hướng Bắc, độ phân giải theo ảnh mịn nhất, ảnh trên đè ảnh dưới,
+  góc trong suốt của ảnh xoay không đè lên ảnh khác; dùng được mọi hệ tọa độ đầu ra.
+- Xuất tile lấy tất cả ảnh đang hiện.
+- Đổi hệ tọa độ bản đồ thì mọi ảnh (và lịch sử hoàn tác của từng ảnh) được dời theo.
+
+### Thay đổi trong mã nguồn
+
+| File | Chỗ thay đổi |
+|---|---|
+| `mosaic.py` | **File mới.** `export_mosaic()` ghép nhiều ảnh bằng `gdal.Warp` (khai báo `srcAlpha` để GDAL coi kênh 4 là mặt nạ). |
+| `dock.py` | Lớp `ImageLayer` (ảnh + lịch sử riêng); danh sách `layers` / ảnh đang chọn `active`; `item`, `_undo`, `_redo`, `_aspect` thành thuộc tính theo ảnh đang chọn. Giao diện danh sách ảnh + nút; ô *Xuất*. Hàm mới: `load_images()`, `_add_layer()`, `set_active()`, `move_active()`, `remove_active_image()`, `export_mode()`, `_export_targets()`; `clear_image()` gỡ tất cả; `do_export()` xử lý 3 kiểu xuất; `_on_map_crs_changed()` quy đổi mọi ảnh. |
+| `overlay.py` | Tách `paint()` thành `paint_image()` / `paint_decorations()`; thêm `paint_outline()`, `paint_label()`, `contains()`; lớp mới `FrameOverlayItem` vẽ khung + tay nắm trên cùng. |
+| `maptool.py` | `set_item()` đổi ảnh đang chỉnh; `find_item_at` + tín hiệu `activateRequested` để bấm chọn ảnh khác trên bản đồ. |
+| `tiledialog.py` | Nhận danh sách `items`; nướng từng ảnh thành lớp tạm; phạm vi = hợp các ảnh. |
+| `metadata.txt`, `README.md` | Phiên bản 1.2.0, mô tả tính năng. |
+
 ## 1.1.0
 
 ### Tính năng mới
